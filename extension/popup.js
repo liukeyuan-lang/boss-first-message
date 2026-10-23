@@ -1,0 +1,19 @@
+'use strict';
+const $=id=>document.getElementById(id);
+async function init(){const {config}=await chrome.storage.local.get('config');const c={...BossCore.DEFAULTS,...config};$('message').value=c.message;$('keywords').value=c.keywords.join('\n');$('limit').value=c.limit;$('interval').value=c.interval;await refresh();}
+async function refresh(){const {state,logs=[]}=await chrome.storage.local.get(['state','logs']);$('status').textContent=state?.label||'先在 BOSS 官网登录，再运行一次预览。';$('start').disabled=$('preview').disabled=!!state?.running;$('logs').replaceChildren(...logs.slice(-12).reverse().map(x=>{const d=document.createElement('div');d.className='entry';d.textContent=x.time+' '+x.text;return d;}));}
+async function start(dry){const config={...BossCore.DEFAULTS,message:$('message').value,keywords:$('keywords').value.split('\n').map(s=>s.trim()).filter(Boolean),limit:Number($('limit').value),interval:Number($('interval').value)};if(!config.message.trim()||!config.keywords.length||config.limit<1||config.limit>100||config.interval<5||config.interval>300){$('status').textContent='请检查话术、关键词、数量（1–100）和间隔（5–300 秒）。';return;}const res=await chrome.runtime.sendMessage({type:'start',config,dry});if(res?.error)$('status').textContent=res.error;else refresh();}
+$('preview').onclick=()=>start(true);$('start').onclick=()=>start(false);$('stop').onclick=async()=>{try{const r=await chrome.runtime.sendMessage({type:'stop'});if(r?.error)throw Error(r.error);}catch(e){$('status').textContent=`停止请求失败：${e.message}`;}await refresh();};$('export').onclick=async()=>{const {records={},logs=[],preview=[],lastFailure=null,lastVerification=null,state=null}=await chrome.storage.local.get(['records','logs','preview','lastFailure','lastVerification','state']);const blob=new Blob([JSON.stringify({records,preview,logs,lastFailure,lastVerification,state},null,2)],{type:'application/json'});const u=URL.createObjectURL(blob);const a=document.createElement('a');a.href=u;a.download='boss-first-message-records.json';a.click();setTimeout(()=>URL.revokeObjectURL(u),1000);};chrome.storage.onChanged.addListener(refresh);init();
+
+$('diagnose').onclick=async()=>{
+ try{const r=await chrome.runtime.sendMessage({type:'diagnose'});if(r.error||r.diagnostic?.error)throw Error(r.error||r.diagnostic.error);
+ const u=URL.createObjectURL(new Blob([JSON.stringify(r.diagnostic,null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=u;a.download='boss-page-diagnostic.json';a.click();setTimeout(()=>URL.revokeObjectURL(u),1000);const safety=r.diagnostic.safety;if(safety?.source){$('status').textContent=`只读安全诊断已导出：${safety.source} / ${safety.pathname}。此记录不表示账号已退出；没有发送消息。`;return;}const company=r.diagnostic.company;$('status').textContent=company?.name?`只读诊断已识别公司：${company.name}（来源：${company.source}）。已导出 JSON，没有发送消息。`:company?.issue?`只读诊断：${company.issue}。已导出 JSON，没有发送消息。`:'已导出页面诊断（没有发送消息），请把 JSON 文件发到对话中。';
+ }catch(e){$('status').textContent=e.message;}
+};
+
+$('verify').onclick=async()=>{
+ try{const r=await chrome.runtime.sendMessage({type:'verifyExistingChat'});if(r.error||r.diagnostic?.error)throw Error(r.error||r.diagnostic.error);
+ const u=URL.createObjectURL(new Blob([JSON.stringify(r.diagnostic,null,2)],{type:'application/json'}));const a=document.createElement('a');a.href=u;a.download='boss-existing-chat-verification.json';a.click();setTimeout(()=>URL.revokeObjectURL(u),1000);
+ const v=r.diagnostic.verification;$('status').textContent=`只读验证通过：${v.method}；发送命令 ${v.sendCommands} 次。unknown/reserved 记录未修改，已导出 JSON。`;
+ }catch(e){$('status').textContent=e.message;}
+};

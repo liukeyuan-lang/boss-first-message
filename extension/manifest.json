@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "岗位筛选与首次招呼",
+  "version": "0.1.10",
+  "description": "本地筛选 AI 产品、FDE、AI 解决方案、AIGC 岗位；只发送预设招呼。",
+  "permissions": [
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "https://www.zhipin.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.zhipin.com/*"
+      ],
+      "js": [
+        "core.js",
+        "content.js"
+      ],
+      "run_at": "document_start"
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+<!doctype html><html lang="zh-CN"><meta charset="UTF-8"><title>元元的求职助手</title><link rel="stylesheet" href="popup.css"><body>
+<h1>只发第一句 <small style="font-size:12px">v0.1.10</small></h1><p>上海 · 深圳 · 珠海优先，杭州不超过约 10%。<br>只在你启动后运行，关闭浏览器即停止。</p>
+<label>搜索词（每行一个）<textarea id="keywords" rows="4"></textarea></label>
+<label>原样发送的话术<textarea id="message" rows="7"></textarea></label>
+<div class="row"><label>本批最多发送<input id="limit" type="number" min="1" max="100"></label><label>两次操作间隔（秒）<input id="interval" type="number" min="5" max="300"></label></div>
+<p class="notice">5–10 秒不是防封保证。遇到登录页路由、可见验证或发送结果不明会停止；登录页路由记录本身不表示账号已退出。已有平台默认招呼或其他我方文字消息时会跳过；竞争分析等系统卡片不算已发招呼。“验证已建立会话”只适用于 unknown/reserved 岗位，会把当前详情标签导航到对应聊天，但不会点击沟通或发送。</p>
+<div class="buttons"><button id="preview">预览筛选（不发消息）</button><button id="start">开始发送</button><button id="stop" class="secondary">停止</button><button id="diagnose" class="secondary">页面诊断（不发消息）</button><button id="verify" class="secondary">验证已建立会话（导航但不发送）</button><button id="export" class="secondary">导出记录</button></div>
+<p id="status" role="status">读取中…</p><div id="logs"></div><script src="core.js"></script><script src="popup.js"></script></body></html>
