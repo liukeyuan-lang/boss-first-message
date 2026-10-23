@@ -31,7 +31,7 @@ async function log(text){const {logs=[]}=await chrome.storage.local.get('logs');
 function safePath(value){try{const url=new URL(String(value||''));return url.origin==='https://www.zhipin.com'?url.pathname:null;}catch{return null;}}
 function runDiagnostic(run,extra={}){
  const read=run?.lastRead?{command:run.lastRead.command,attempt:run.lastRead.attempt,maxAttempts:run.lastRead.maxAttempts,budgetMs:run.lastRead.budgetMs||null,elapsedMs:run.lastRead.elapsedMs||null,lastWaitReason:run.lastRead.lastWaitReason||null}:null;
- return {version:'0.1.10',phase:run?.phase||null,phaseElapsedMs:run?.phaseStarted?Math.max(0,Date.now()-run.phaseStarted):null,expectedChatPath:run?.expectedChatPath||null,currentPath:run?.currentPath||null,lastRead:read,navigation:run?.navigation?{...run.navigation}:null,contentRecovery:run?.contentRecovery?{command:run.contentRecovery.command,method:run.contentRecovery.method}:null,scanPartial:run?.scanPartial?{...run.scanPartial}:null,...extra};
+ return {version:'0.1.11',phase:run?.phase||null,phaseElapsedMs:run?.phaseStarted?Math.max(0,Date.now()-run.phaseStarted):null,expectedChatPath:run?.expectedChatPath||null,currentPath:run?.currentPath||null,lastRead:read,navigation:run?.navigation?{...run.navigation}:null,contentRecovery:run?.contentRecovery?{command:run.contentRecovery.command,method:run.contentRecovery.method}:null,scanPartial:run?.scanPartial?{...run.scanPartial}:null,...extra};
 }
 async function status(label,running=true,run=null){await chrome.storage.local.set({state:{running,label,updated:Date.now(),diagnostic:run?runDiagnostic(run):null}});}
 async function phase(run,name,label){run.phase=name;run.phaseStarted=Date.now();await status(label,true,run);}
@@ -118,7 +118,7 @@ async function read(run,command,data={}){
    lastConnectionError=e;if(n===attempts-1)throw failure('PAGE_CONNECTION_FAILED','页面扩展连接失效：'+e.message,{command,attempt:n+1,maxAttempts:attempts});
   }
   if(result?.pagePath)run.currentPath=result.pagePath;
-  if(result?.error)throw failure('PAGE_REJECTED',result.error,{command,attempt:n+1,maxAttempts:attempts});
+  if(result?.error)throw failure('PAGE_REJECTED',result.error,{command,attempt:n+1,maxAttempts:attempts,identityDiagnostic:result.identityDiagnostic||null});
   if(command==='scan'&&await recoverEmptyScanShell(run,result,n+1))continue;
   if(command==='chatReady'&&result?.conversationSelected)data.allowConversationSelection=false;
   if(result&&!result.wait){run.lastRead={command,attempt:n+1,maxAttempts:attempts,budgetMs,elapsedMs:Math.max(0,Date.now()-started),lastWaitReason:null};return result;}
@@ -127,7 +127,7 @@ async function read(run,command,data={}){
  }
  const lastReason=result?.reason||lastConnectionError?.message||'页面结构未识别';
  const label=command==='chatReady'?`聊天页就绪等待超时（总上限 ${Math.ceil(budgetMs/1000)} 秒）：${lastReason}。已停止；不会自动重试建立沟通或发送消息`:`${command} 页面读取超时：${lastReason}。已停止，请导出记录`;
- throw failure(command==='chatReady'?'CHAT_READY_TIMEOUT':'READ_TIMEOUT',label,{command,attempt:completedAttempts,maxAttempts:attempts,budgetMs,elapsedMs:Math.max(0,Date.now()-started),lastWaitReason:lastReason});
+ throw failure(command==='chatReady'?'CHAT_READY_TIMEOUT':'READ_TIMEOUT',label,{command,attempt:completedAttempts,maxAttempts:attempts,budgetMs,elapsedMs:Math.max(0,Date.now()-started),lastWaitReason:lastReason,identityDiagnostic:result?.identityDiagnostic||null});
 }
 async function sendOnce(run,data){
  await check(run);
@@ -228,7 +228,7 @@ async function diagnoseChatBinding(tab,diagnostic,expectedMessage){
   if(ready?.error)throw Error(ready.error);
   const acceptedMethods=new Set(['job-link','title-company','public-fingerprint']);
   if(!ready?.ready||!acceptedMethods.has(ready.method))throw Error('当前聊天未通过可接受的公开岗位身份核对');
-  const after=await passiveBounded(chrome.tabs.sendMessage(tab.id,{command:'diagnose',expectedMessage}),TIMEOUTS.diagnosticCall,'聊天诊断响应');
+  const after=await passiveBounded(chrome.tabs.sendMessage(tab.id,{command:'diagnose',expectedMessage,expectedSalary:detail.salary}),TIMEOUTS.diagnosticCall,'聊天诊断响应');
   const beforeFingerprint=JSON.stringify([diagnostic?.selectedJob?.controlText||[],diagnostic?.selectedConversationEntry||null]);
   const afterFingerprint=JSON.stringify([after?.selectedJob?.controlText||[],after?.selectedConversationEntry||null]);
   const headerStable=beforeFingerprint===afterFingerprint;
@@ -257,10 +257,10 @@ async function verifyExistingChat(tab){
   if(!detail.salary||!detail.recruiterName||!detail.recruiterCompany||!detail.recruiterRole)throw Error('岗位详情缺少完整公开身份字段，不能验证聊天对象');
   await enterDirectedChat(run,detail);
   await phase(run,'verify-existing-chat','只读核对已建立会话：不会点击沟通或发送');
-  const data={key,title:detail.title,city:detail.city,salary:detail.salary,company:detail.company,companyKey:detail.companyKey,companyAliases:detail.companyAliases,recruiterName:detail.recruiterName,recruiterCompany:detail.recruiterCompany,recruiterRole:detail.recruiterRole};
-  const ready=await read(run,'chatReady',data);const chat=await call(run,'diagnose',{},TIMEOUTS.diagnosticCall);
+  const data={key,runId:run.id,requireIdentityStability:true,title:detail.title,city:detail.city,salary:detail.salary,company:detail.company,companyKey:detail.companyKey,companyAliases:detail.companyAliases,recruiterName:detail.recruiterName,recruiterCompany:detail.recruiterCompany,recruiterRole:detail.recruiterRole};
+  const ready=await read(run,'chatReady',data);const chat=await call(run,'diagnose',{expectedSalary:detail.salary,runId:run.id},TIMEOUTS.diagnosticCall);
   if(chat?.error)throw Error(chat.error);
-  const diagnostic={version:'0.1.10',pagePath:run.currentPath,verification:{checked:true,matched:true,expectedJobPath:key,method:ready.method,navigation:run.navigation,editorReady:chat?.counts?.['#chat-input']===1,substantiveOutgoing:chat?.outgoingShape?.substantive||0,openCommands:0,sendCommands:0,recordStatusUnchanged:record.status},communicationTarget:detail.communicationTarget,note:'已建立会话的定向导航与公开身份只读验证；仅适用于当前详情与本地未确认记录精确匹配且页面已显示继续沟通的岗位。没有点击立即沟通、没有填写草稿、没有发送消息、没有修改历史记录；不含聊天地址参数值、Cookie、LocalStorage、聊天正文或联系人列表。'};
+  const diagnostic={version:'0.1.11',pagePath:run.currentPath,verification:{checked:true,matched:true,expectedJobPath:key,method:ready.method,navigation:run.navigation,editorReady:chat?.counts?.['#chat-input']===1,substantiveOutgoing:chat?.outgoingShape?.substantive||0,openCommands:0,sendCommands:0,recordStatusUnchanged:record.status},salaryComparison:chat?.salaryComparison||null,communicationTarget:detail.communicationTarget,note:'已建立会话的定向导航与公开身份只读验证；仅适用于当前详情与本地未确认记录精确匹配且页面已显示继续沟通的岗位。没有点击沟通、没有填写草稿、没有发送消息、没有修改历史记录；不含聊天地址参数值、Cookie、LocalStorage、聊天正文或联系人列表。'};
   await chrome.storage.local.set({lastVerification:{time:new Date().toISOString(),ok:true,...diagnostic}});
   if(activeRun===run)await status(`只读验证通过：已定向并核对 ${detail.title}\n没有建立新沟通或发送消息；${record.status} 记录保持不变。`,false,run);
   return diagnostic;
@@ -333,6 +333,7 @@ async function execute(run){
    // that fallback only, click one exact recruiter tuple once, then re-run all
    // existing job/recipient checks. Native site navigation needs no extra click.
    sendData.allowConversationSelection=run.navigation?.method==='official-directed-url';
+   sendData.requireIdentityStability=true;
    await phase(run,'chat-readiness','正在核对该岗位聊天对象和输入区域；不会发送到未核对对象');
    await read(run,'chatReady',sendData);
    await phase(run,'send-once',`聊天对象已核对；正在执行一次原话术发送：${job.title}`);
@@ -350,7 +351,7 @@ async function execute(run){
   // original failure classification while preventing a late content response
   // from advancing into open/send during catch cleanup.
   cancel(run);cancelContent(run);
-  const safetyDiagnostic=stopped?null:run.lastSafety?{version:'0.1.10',safety:run.lastSafety,candidate:run.lastSafetyCandidate||null}:await captureSafetyContext(run);
+  const safetyDiagnostic=stopped?null:run.lastSafety?{version:'0.1.11',safety:run.lastSafety,candidate:run.lastSafetyCandidate||null}:await captureSafetyContext(run);
   const baseReason=stopped?'已停止：已撤销仍在等待的页面读取和后续发送授权；已经点击的“立即沟通”或发送动作无法撤回。':e.message;
   const reason=safetyDiagnostic?`${baseReason}\n已记录安全诊断：${safetyDiagnostic.safety.source} ${safetyDiagnostic.safety.pathname}；该记录不表示账号已退出。`:baseReason;
   const diagnostic=runDiagnostic(run,{errorCode:e.code||'UNCLASSIFIED',errorDetails:e.details||null,stopped});
