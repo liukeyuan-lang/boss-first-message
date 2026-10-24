@@ -31,8 +31,13 @@ async function log(text){const {logs=[]}=await chrome.storage.local.get('logs');
 function safePath(value){try{const url=new URL(String(value||''));return url.origin==='https://www.zhipin.com'?url.pathname:null;}catch{return null;}}
 function runDiagnostic(run,extra={}){
  const read=run?.lastRead?{command:run.lastRead.command,attempt:run.lastRead.attempt,maxAttempts:run.lastRead.maxAttempts,budgetMs:run.lastRead.budgetMs||null,elapsedMs:run.lastRead.elapsedMs||null,lastWaitReason:run.lastRead.lastWaitReason||null}:null;
- return {version:'0.1.11',phase:run?.phase||null,phaseElapsedMs:run?.phaseStarted?Math.max(0,Date.now()-run.phaseStarted):null,expectedChatPath:run?.expectedChatPath||null,currentPath:run?.currentPath||null,lastRead:read,navigation:run?.navigation?{...run.navigation}:null,contentRecovery:run?.contentRecovery?{command:run.contentRecovery.command,method:run.contentRecovery.method}:null,scanPartial:run?.scanPartial?{...run.scanPartial}:null,...extra};
+ return {version:'0.1.12',phase:run?.phase||null,phaseElapsedMs:run?.phaseStarted?Math.max(0,Date.now()-run.phaseStarted):null,expectedChatPath:run?.expectedChatPath||null,currentPath:run?.currentPath||null,lastRead:read,navigation:run?.navigation?{...run.navigation}:null,openPreflight:run?.openPreflight?{...run.openPreflight}:null,openConfirmation:run?.openConfirmation?{...run.openConfirmation,buttonState:run.openConfirmation.buttonState?{...run.openConfirmation.buttonState}:null}:null,conversationActivation:run?.conversationActivation?{...run.conversationActivation}:null,chatRecovery:run?.chatRecovery?{...run.chatRecovery,emptyState:run.chatRecovery.emptyState?{...run.chatRecovery.emptyState}:null}:null,contentRecovery:run?.contentRecovery?{command:run.contentRecovery.command,method:run.contentRecovery.method}:null,scanPartial:run?.scanPartial?{...run.scanPartial}:null,summaryCounts:run?.summary?{...run.summary.counts,attemptedByCity:{...run.summary.counts.attemptedByCity},sentByCity:{...run.summary.counts.sentByCity},unknownByCity:{...run.summary.counts.unknownByCity}}:null,...extra};
 }
+function cityCounter(){return {上海:0,深圳:0,珠海:0,杭州:0};}
+function createRunSummary(run){return {version:'0.1.12',runId:run.id,dry:!!run.dry,limit:run.config.limit,intervalSeconds:run.config.interval,startedAt:new Date().toISOString(),finishedAt:null,outcome:'running',reasonCode:null,reason:null,counts:{queuedCandidates:0,filteredMatches:0,preflightSkipped:0,connectionAttempts:0,sentConfirmed:0,existingConversationMessages:0,unknown:0,attemptedByCity:cityCounter(),sentByCity:cityCounter(),unknownByCity:cityCounter()}};}
+function resetCandidateDiagnostics(run){for(const field of ['navigation','openPreflight','openConfirmation','conversationActivation','chatRecovery','lastRead','currentPath','expectedChatPath','contentRecovery'])run[field]=null;run.chatRecoveryUsed=false;}
+async function saveRunSummary(run){if(run?.summary)await chrome.storage.local.set({lastRunSummary:run.summary});}
+async function finishRunSummary(run,outcome,reasonCode=null,reason=null){if(!run.summary)return;run.summary.outcome=outcome;run.summary.reasonCode=reasonCode;run.summary.reason=reason;run.summary.finishedAt=new Date().toISOString();await saveRunSummary(run);}
 async function status(label,running=true,run=null){await chrome.storage.local.set({state:{running,label,updated:Date.now(),diagnostic:run?runDiagnostic(run):null}});}
 async function phase(run,name,label){run.phase=name;run.phaseStarted=Date.now();await status(label,true,run);}
 async function records(){return (await chrome.storage.local.get('records')).records||{};}
@@ -100,16 +105,29 @@ async function recoverEmptyScanShell(run,result,attempt){
  await wait(run,1200);
  return true;
 }
+async function recoverEmptyChatShell(run,result,attempt,data,deadline){
+ const state=result?.chatState;
+ const navigated=run.navigation&&['site-click','official-directed-url'].includes(run.navigation.method)&&['chat-route','navigated'].includes(run.navigation.outcome);
+ const remaining=()=>Math.max(0,deadline-Date.now());
+ if(attempt<5||run.chatRecoveryUsed||!run.pending||run.lastSafety||run.phase!=='chat-readiness'||!navigated||!result?.wait||!state?.emptyShell||remaining()<2000)return false;
+ const tab=await currentTab(run,Math.min(TIMEOUTS.tabGet,remaining()));if(safePath(tab.url)!=='/web/geek/chat'||tab.pendingUrl||remaining()<1500)return false;
+ run.chatRecoveryUsed=true;run.chatRecovery={method:'single-empty-chat-shell-reload',attempt,routePath:'/web/geek/chat',beforeSend:true,emptyState:{...state}};
+ data.allowConversationSelection=true;
+ await status('聊天页已提交但仍是空外壳；正在只读刷新同一任务标签一次\n不会重复建立沟通或发送消息',true,run);
+ await bounded(run,chrome.tabs.reload(run.tab),Math.max(1,Math.min(TIMEOUTS.tabUpdate,remaining())),'CHAT_SHELL_RECOVERY_TIMEOUT','聊天空外壳恢复刷新');
+ const settleMs=Math.min(1200,remaining());if(settleMs>0)await wait(run,settleMs);return true;
+}
 // A completed tab only means the document finished loading. BOSS renders the job
 // cards afterwards, so give a list page a bounded hydration window. Detail/chat
 // reads keep their shorter window; sending is never retried after a port error.
-const READ_ATTEMPTS={scan:50,detail:25,chatReady:40};
-const READ_BUDGET_MS={scan:45000,detail:20000,chatReady:35000};
+const READ_ATTEMPTS={scan:50,detail:25,openPreflight:15,chatReady:40};
+const READ_BUDGET_MS={scan:45000,detail:20000,openPreflight:15000,chatReady:35000};
 async function read(run,command,data={}){
  let result,lastConnectionError;const attempts=READ_ATTEMPTS[command]||12,budgetMs=READ_BUDGET_MS[command]||20000,started=Date.now();let completedAttempts=0;
  for(let n=0;n<attempts;n++){
   await check(run);const elapsedMs=Math.max(0,Date.now()-started);let remainingMs=budgetMs-elapsedMs;if(remainingMs<=0)break;completedAttempts=n+1;run.lastRead={command,attempt:n+1,maxAttempts:attempts,budgetMs,elapsedMs,lastWaitReason:result?.reason||null};
   if(command==='chatReady')await status(`等待该岗位聊天页就绪：${n+1}/${attempts}\n本阶段总上限 ${Math.ceil(budgetMs/1000)} 秒；不会切换已有聊天标签`,true,run);
+  if(command==='openPreflight')await status(`发送前稳定核对岗位详情与沟通控件：${n+1}/${attempts}\n尚未建立沟通或发送消息`,true,run);
   remainingMs=budgetMs-Math.max(0,Date.now()-started);if(remainingMs<=0)break;
   result=undefined;
   try{result=await call(run,command,data,Math.min(TIMEOUTS.readCall,remainingMs));}catch(e){
@@ -120,7 +138,12 @@ async function read(run,command,data={}){
   if(result?.pagePath)run.currentPath=result.pagePath;
   if(result?.error)throw failure('PAGE_REJECTED',result.error,{command,attempt:n+1,maxAttempts:attempts,identityDiagnostic:result.identityDiagnostic||null});
   if(command==='scan'&&await recoverEmptyScanShell(run,result,n+1))continue;
-  if(command==='chatReady'&&result?.conversationSelected)data.allowConversationSelection=false;
+  if(command==='chatReady'&&await recoverEmptyChatShell(run,result,n+1,data,started+budgetMs))continue;
+  if(command==='chatReady'&&result?.conversationSelected){
+   run.conversationActivation={method:'exact-recruiter-tuple-click',clicked:result.conversationActivated===true,pagePath:result.pagePath||run.currentPath||null};
+   if(data.requireConversationActivation&&!run.conversationActivation.clicked)throw failure('CONVERSATION_ACTIVATION_FAILED','精确招聘者会话未完成单次激活，已停止且不会发送消息');
+   data.allowConversationSelection=false;
+  }
   if(result&&!result.wait){run.lastRead={command,attempt:n+1,maxAttempts:attempts,budgetMs,elapsedMs:Math.max(0,Date.now()-started),lastWaitReason:null};return result;}
   run.lastRead={command,attempt:n+1,maxAttempts:attempts,budgetMs,elapsedMs:Math.max(0,Date.now()-started),lastWaitReason:result?.reason||lastConnectionError?.message||null};
   const waitMs=Math.min(1000,Math.max(0,budgetMs-(Date.now()-started)));if(n<attempts-1&&waitMs>0)await wait(run,waitMs);
@@ -148,11 +171,36 @@ function directedChatUrl(job){
   return url.href;
  }catch{return null;}
 }
+function conversationActivationRequired(navigation){
+ return !!navigation&&(navigation.method==='site-click'&&navigation.outcome==='chat-route'||navigation.method==='official-directed-url'&&navigation.outcome==='navigated');
+}
+function unknownSendFailure(result){
+ const knownCodes=new Set(['SEND_IDENTITY_CHANGED','SEND_FAILURE_MARKER','SEND_RECEIPT_UNCONFIRMED']);
+ const code=knownCodes.has(result?.failureCode)?result.failureCode:'SEND_RESULT_UNKNOWN';
+ const state=result?.sendState||{};
+ const receipt=['delivered','read'].includes(state.receipt)?state.receipt:null;
+ const statusClasses=Array.isArray(state.statusClasses)?state.statusClasses.filter(value=>typeof value==='string'&&/^(?:message-status|status-(?:delivery|read|unread|sending|loading|fail|error)|send-(?:success|fail|error)|retry|error)$/.test(value)).slice(0,12):[];
+ const sendState={exactMessageBubble:state.exactMessageBubble===true,bubbleConnected:state.bubbleConnected===true,editorPresent:state.editorPresent===true,editorEmpty:state.editorEmpty===true,receipt,failureMarker:state.failureMarker===true,identityStable:state.identityStable===true,statusClasses,observationReads:Number.isInteger(state.observationReads)?Math.max(0,Math.min(100,state.observationReads)):null};
+ return failure(code,result?.reason||'发送回执不明，已停止且不会自动重发',{sendState});
+}
 function canContinueWithPartialScan(run,error,queue){
  const reason=error?.details?.lastWaitReason||'';
  const counts=reason.match(/^识别到 (\d+) 张卡片；缺详情链接 0，缺城市 0，其他城市 (\d+)/);
  const safelyRejectedStaleCity=run.contentRecovery?.command==='scan'&&['single-empty-shell-reload','single-stale-city-reload'].includes(run.contentRecovery?.method)&&counts&&Number(counts[1])>0&&counts[1]===counts[2];
  return !run.pending&&!run.lastSafety&&queue.length>0&&error?.code==='READ_TIMEOUT'&&error?.details?.command==='scan'&&(/^没有识别到岗位卡片/.test(reason)||safelyRejectedStaleCity);
+}
+function canSkipUnusableDetail(run,error){
+ const reason=error?.details?.lastWaitReason||'';
+ const knownPreExternalWait=error?.details?.command==='detail'?/^岗位详情发送前公开字段尚未完整加载：/.test(reason):error?.details?.command==='openPreflight'&&/^正在等待岗位详情与“立即沟通”控件稳定$/.test(reason);
+ return !run.pending&&!run.lastSafety&&error?.code==='READ_TIMEOUT'&&knownPreExternalWait;
+}
+function sendPreflightIssue(job){
+ if(!job.company||!job.companyKey)return job.companyIssue||'公司名称缺失，无法核对收件人';
+ const missing=[!job.salary&&'薪资',!job.recruiterName&&'招聘者姓名',!job.recruiterCompany&&'招聘者机构',!job.recruiterRole&&'招聘者身份'].filter(Boolean);
+ if(missing.length)return `岗位详情缺少${missing.join('、')}公开字段，无法安全核对聊天对象`;
+ if(!validUrl(job.chatUrl,'/web/geek/chat'))return '未识别该岗位的官方聊天链接';
+ if(!directedChatUrl(job))return '岗位按钮只提供通用聊天地址或含义不足的参数，无法确认它能定向到当前岗位/招聘者';
+ return null;
 }
 async function currentTab(run,timeoutMs=TIMEOUTS.tabGet){return bounded(run,chrome.tabs.get(run.tab),timeoutMs,'TAB_STATE_TIMEOUT','工作标签状态读取');}
 async function enterDirectedChat(run,job){
@@ -162,11 +210,12 @@ async function enterDirectedChat(run,job){
  // Wait for a committed native chat route or the same detail button's public
  // established state before using its directed URL. Never interrupt pending
  // establishment merely because a click call returned.
- let tab,current,openConfirmed=!!run.verifyOnly,lastOpenReason=null;const nativeDeadline=Date.now()+TIMEOUTS.openConfirmation,nativeAttempts=run.verifyOnly?1:31;
+ let tab,current,openConfirmed=!!run.verifyOnly,lastOpenReason=null;const confirmationStarted=Date.now(),nativeDeadline=confirmationStarted+TIMEOUTS.openConfirmation,nativeAttempts=run.verifyOnly?1:31;run.openConfirmation={budgetMs:TIMEOUTS.openConfirmation,observations:0,elapsedMs:0,currentPath:null,pendingPath:null,buttonState:null,lastReason:null,outcome:run.verifyOnly?'verification-preconfirmed':'waiting'};
  for(let attempt=0;attempt<nativeAttempts;attempt++){
   const remaining=Math.max(0,nativeDeadline-Date.now());if(!remaining&&attempt>0)break;
-  tab=await currentTab(run,Math.max(1,Math.min(TIMEOUTS.tabGet,remaining||1)));current=safePath(tab.url);run.currentPath=current;
+  tab=await currentTab(run,Math.max(1,Math.min(TIMEOUTS.tabGet,remaining||1)));current=safePath(tab.url);run.currentPath=current;run.openConfirmation.observations++;run.openConfirmation.elapsedMs=Math.max(0,Date.now()-confirmationStarted);run.openConfirmation.currentPath=current;run.openConfirmation.pendingPath=safePath(tab.pendingUrl);
   if(current==='/web/geek/chat'){
+   run.openConfirmation.outcome='native-chat-route';
    run.navigation={method:'site-click',sourcePath:'/job_detail/',targetPath:'/web/geek/chat',outcome:'chat-route'};
    return;
   }
@@ -175,19 +224,20 @@ async function enterDirectedChat(run,job){
     const state=await call(run,'openReady',{key:jobKey},Math.min(TIMEOUTS.diagnosticCall,Math.max(1,remaining||1)));
     if(state?.error)throw failure('PAGE_REJECTED',state.error);
     if(state?.opened){openConfirmed=true;lastOpenReason=null;}
-    lastOpenReason=state?.reason||null;
+    lastOpenReason=state?.reason||null;run.openConfirmation.buttonState=state?.buttonState||null;run.openConfirmation.lastReason=lastOpenReason;run.openConfirmation.elapsedMs=Math.max(0,Date.now()-confirmationStarted);if(openConfirmed)run.openConfirmation.outcome='button-confirmed';
    }catch(e){if(e.code==='STOPPED'||e.code==='MESSAGE_TIMEOUT'||e.code==='PAGE_REJECTED')throw e;lastOpenReason=e.message;}
   }
   const waitMs=Math.min(500,Math.max(0,nativeDeadline-Date.now()));if(attempt<nativeAttempts-1&&waitMs>0)await wait(run,waitMs);
  }
  if(safePath(tab?.pendingUrl)==='/web/geek/chat'){
   await waitForCommittedNavigation(run,'https://www.zhipin.com/web/geek/chat','网站原生聊天导航');
-  run.navigation={method:'site-click',sourcePath:'/job_detail/',targetPath:'/web/geek/chat',outcome:'chat-route'};
+  run.openConfirmation.outcome='pending-chat-route-committed';run.openConfirmation.elapsedMs=Math.max(0,Date.now()-confirmationStarted);run.navigation={method:'site-click',sourcePath:'/job_detail/',targetPath:'/web/geek/chat',outcome:'chat-route'};
   return;
  }
  if(!openConfirmed){
+  run.openConfirmation.outcome='unconfirmed';run.openConfirmation.elapsedMs=Math.max(0,Date.now()-confirmationStarted);
   run.navigation={method:'site-click',sourcePath:current,targetPath:job?.communicationTarget?.redirectPath||null,outcome:'open-unconfirmed'};
-  throw failure('OPEN_NOT_CONFIRMED',`“立即沟通”已点击一次，但网站在 ${Math.ceil(TIMEOUTS.openConfirmation/1000)} 秒内未公开确认已建立沟通：${lastOpenReason||'按钮未变为继续沟通'}。已停止，不会导航聊天或发送消息`);
+  throw failure('OPEN_NOT_CONFIRMED',`“立即沟通”已点击一次，但网站在 ${Math.ceil(TIMEOUTS.openConfirmation/1000)} 秒内未公开确认已建立沟通：${lastOpenReason||'按钮未变为继续沟通'}。已停止，不会导航聊天或发送消息`,{openConfirmation:{...run.openConfirmation,buttonState:run.openConfirmation.buttonState?{...run.openConfirmation.buttonState}:null}});
  }
  const target=directedChatUrl(job);
  if(!target){
@@ -228,7 +278,7 @@ async function diagnoseChatBinding(tab,diagnostic,expectedMessage){
   if(ready?.error)throw Error(ready.error);
   const acceptedMethods=new Set(['job-link','title-company','public-fingerprint']);
   if(!ready?.ready||!acceptedMethods.has(ready.method))throw Error('当前聊天未通过可接受的公开岗位身份核对');
-  const after=await passiveBounded(chrome.tabs.sendMessage(tab.id,{command:'diagnose',expectedMessage,expectedSalary:detail.salary}),TIMEOUTS.diagnosticCall,'聊天诊断响应');
+  const after=await passiveBounded(chrome.tabs.sendMessage(tab.id,{command:'diagnose',expectedMessage,expectedTitle:detail.title,expectedCity:detail.city,expectedSalary:detail.salary,expectedCompany:detail.company,key}),TIMEOUTS.diagnosticCall,'聊天诊断响应');
   const beforeFingerprint=JSON.stringify([diagnostic?.selectedJob?.controlText||[],diagnostic?.selectedConversationEntry||null]);
   const afterFingerprint=JSON.stringify([after?.selectedJob?.controlText||[],after?.selectedConversationEntry||null]);
   const headerStable=beforeFingerprint===afterFingerprint;
@@ -258,9 +308,9 @@ async function verifyExistingChat(tab){
   await enterDirectedChat(run,detail);
   await phase(run,'verify-existing-chat','只读核对已建立会话：不会点击沟通或发送');
   const data={key,runId:run.id,requireIdentityStability:true,title:detail.title,city:detail.city,salary:detail.salary,company:detail.company,companyKey:detail.companyKey,companyAliases:detail.companyAliases,recruiterName:detail.recruiterName,recruiterCompany:detail.recruiterCompany,recruiterRole:detail.recruiterRole};
-  const ready=await read(run,'chatReady',data);const chat=await call(run,'diagnose',{expectedSalary:detail.salary,runId:run.id},TIMEOUTS.diagnosticCall);
+  const ready=await read(run,'chatReady',data);const chat=await call(run,'diagnose',{expectedTitle:detail.title,expectedCity:detail.city,expectedSalary:detail.salary,expectedCompany:detail.company,key,runId:run.id},TIMEOUTS.diagnosticCall);
   if(chat?.error)throw Error(chat.error);
-  const diagnostic={version:'0.1.11',pagePath:run.currentPath,verification:{checked:true,matched:true,expectedJobPath:key,method:ready.method,navigation:run.navigation,editorReady:chat?.counts?.['#chat-input']===1,substantiveOutgoing:chat?.outgoingShape?.substantive||0,openCommands:0,sendCommands:0,recordStatusUnchanged:record.status},salaryComparison:chat?.salaryComparison||null,communicationTarget:detail.communicationTarget,note:'已建立会话的定向导航与公开身份只读验证；仅适用于当前详情与本地未确认记录精确匹配且页面已显示继续沟通的岗位。没有点击沟通、没有填写草稿、没有发送消息、没有修改历史记录；不含聊天地址参数值、Cookie、LocalStorage、聊天正文或联系人列表。'};
+  const diagnostic={version:'0.1.12',pagePath:run.currentPath,verification:{checked:true,matched:true,expectedJobPath:key,method:ready.method,navigation:run.navigation,editorReady:chat?.counts?.['#chat-input']===1,substantiveOutgoing:chat?.outgoingShape?.substantive||0,openCommands:0,sendCommands:0,recordStatusUnchanged:record.status},publicFields:chat?.selectedJob?.publicFields||null,salaryComparison:chat?.salaryComparison||null,communicationTarget:detail.communicationTarget,note:'已建立会话的定向导航与公开身份只读验证；仅适用于当前详情与本地未确认记录精确匹配且页面已显示继续沟通的岗位。没有点击沟通、没有填写草稿、没有发送消息、没有修改历史记录；不含聊天地址参数值、Cookie、LocalStorage、聊天正文或联系人列表。'};
   await chrome.storage.local.set({lastVerification:{time:new Date().toISOString(),ok:true,...diagnostic}});
   if(activeRun===run)await status(`只读验证通过：已定向并核对 ${detail.title}\n没有建立新沟通或发送消息；${record.status} 记录保持不变。`,false,run);
   return diagnostic;
@@ -293,69 +343,84 @@ async function execute(run){
    for(const job of out.jobs){const key=BossCore.key(job.url);if(key&&!seen.has(key)&&!prior[key]){seen.add(key);queue.push({...job,key,searchCity:city});}}
    await log(`${city} / ${keyword}：读取 ${out.jobs.length} 条，累计候选 ${queue.length}`);await wait(run,1500);
   }}
-  let processed=0, sent=0, attempted=0;const cityCounts={上海:0,深圳:0,珠海:0,杭州:0};const thisBatch=[];
+  run.summary.counts.queuedCandidates=queue.length;await saveRunSummary(run);
+  let processed=0, sent=0, attempted=0, skippedUnsafe=0;const cityCounts={上海:0,深圳:0,珠海:0,杭州:0};const thisBatch=[];
   while(queue.length && (run.dry?processed<c.limit:attempted<c.limit)){
    await check(run);
    queue.sort((a,b)=>{const rank=j=>j.city==='杭州'?(BossCore.hzAllowed(thisBatch,c.hangzhouPercent)?-1:100000):(cityCounts[j.city]||0);return rank(a)-rank(b);});
    const candidate=queue.shift();
+   resetCandidateDiagnostics(run);
    run.currentJob={key:candidate.key,title:candidate.title};
    if(candidate.city==='杭州'&&!BossCore.hzAllowed(thisBatch,c.hangzhouPercent)){await log('杭州：本批比例不足，跳过剩余杭州候选');continue;}
    if((await records())[candidate.key])continue;
    run.phase='detail';run.phaseStarted=Date.now();await status(`${run.dry?'预览':'筛选'}：${candidate.title}（${candidate.city}）\n本批页面确认已发 ${sent}，已尝试 ${attempted}/${c.limit}`,true,run);
-   await page(run,candidate.url);const job=await read(run,'detail');
+   await page(run,candidate.url);let job;
+   try{job=await read(run,'detail',{requireSendIdentity:!run.dry});}catch(e){
+    if(!canSkipUnusableDetail(run,e))throw e;
+    skippedUnsafe++;run.summary.counts.preflightSkipped++;await saveRunSummary(run);await log(`跳过 ${candidate.title}：${e.details.lastWaitReason}；未建立沟通或发送`);run.currentJob=null;continue;
+   }
    if(BossCore.key(job.url)!==candidate.key)throw Error('岗位详情跳转不一致，已停止');
    run.currentJob={key:candidate.key,title:job.title||candidate.title};
    if(job.city!==candidate.city){await log(`跳过 ${candidate.title}：详情城市不一致或无法确认`);run.currentJob=null;continue;}
    const decision=BossCore.fit(job.title,job.jd);
    if(!decision.ok||job.talked){await log(`跳过 ${job.title}：${job.talked?'已沟通过':decision.reason}`);run.currentJob=null;continue;}
-   if(!job.company||!job.companyKey)throw Error(job.companyIssue||'公司名称缺失，无法核对收件人，已停止');
-   processed++;preview.push({...candidate,title:job.title,company:job.company,reason:decision.reason});await chrome.storage.local.set({preview});
+   if(!job.company||!job.companyKey){skippedUnsafe++;run.summary.counts.preflightSkipped++;await saveRunSummary(run);await log(`跳过 ${job.title||candidate.title}：${job.companyIssue||'公司名称缺失，无法核对收件人'}；未建立沟通或发送`);run.currentJob=null;continue;}
+   processed++;run.summary.counts.filteredMatches++;preview.push({...candidate,title:job.title,company:job.company,reason:decision.reason});await chrome.storage.local.set({preview});await saveRunSummary(run);
    if(run.dry){cityCounts[job.city]++;thisBatch.push({city:job.city,status:'reserved'});await log(`符合：${job.city} / ${job.title} / ${job.company}`);continue;}
-   if(!job.salary||!job.recruiterName||!job.recruiterCompany||!job.recruiterRole)throw Error('岗位详情缺少薪资或招聘者公开身份字段，无法安全核对聊天对象，已停止');
-   if(!validUrl(job.chatUrl,'/web/geek/chat'))throw Error('未识别该岗位的官方聊天链接，已停止');
-   if(!directedChatUrl(job))throw failure('CHAT_TARGET_UNSAFE','岗位按钮只提供通用聊天地址或含义不足的参数，无法确认它能定向到当前岗位/招聘者。未点击“立即沟通”，未发送消息',{communicationTarget:job.communicationTarget||null});
+   const preflightIssue=sendPreflightIssue(job);
+   if(preflightIssue){skippedUnsafe++;run.summary.counts.preflightSkipped++;await saveRunSummary(run);await log(`跳过 ${job.title}：${preflightIssue}；未建立沟通或发送`);run.currentJob=null;continue;}
+   const sendData={key:candidate.key,runId:run.id,title:job.title,city:job.city,salary:job.salary,company:job.company,companyKey:job.companyKey,companyAliases:job.companyAliases,recruiterName:job.recruiterName,recruiterCompany:job.recruiterCompany,recruiterRole:job.recruiterRole,message:c.message,allowConversationSelection:false};
+   await phase(run,'open-preflight',`正在稳定核对岗位详情与沟通控件：${job.title}\n尚未建立沟通或发送消息`);
+   try{const stableOpen=await read(run,'openPreflight',sendData);run.openPreflight={stableSnapshotReads:stableOpen.stableSnapshotReads,elapsedMs:stableOpen.elapsedMs};}catch(e){
+    if(!canSkipUnusableDetail(run,e))throw e;
+    skippedUnsafe++;run.summary.counts.preflightSkipped++;await saveRunSummary(run);await log(`跳过 ${job.title}：沟通控件未在发送前稳定就绪；未建立沟通或发送`);run.currentJob=null;continue;
+   }
    // Persist BEFORE any external effect. Unknown/reserved attempts are never retried automatically.
    await put(candidate.key,{status:'reserved',runId:run.id,city:job.city,title:job.title,company:job.company,url:candidate.url,communicationTarget:job.communicationTarget});
-   run.pending={key:candidate.key,title:job.title,company:job.company};attempted++;cityCounts[job.city]++;thisBatch.push({city:job.city,status:'reserved'});
+   run.pending={key:candidate.key,title:job.title,company:job.company,city:job.city};attempted++;run.summary.counts.connectionAttempts++;run.summary.counts.attemptedByCity[job.city]++;cityCounts[job.city]++;thisBatch.push({city:job.city,status:'reserved'});await saveRunSummary(run);
    await check(run);
    await phase(run,'open-conversation',`正在为该岗位建立一次沟通：${job.title}\n此动作只调用一次，结果不明不会重试`);
-   try{const opened=await call(run,'open',{key:candidate.key,runId:run.id,expiresAt:Date.now()+3500},TIMEOUTS.openCall);if(opened?.error)throw Error(opened.error);}catch(e){
+   try{const opened=await call(run,'open',{...sendData,requireStablePreflight:true,expiresAt:Date.now()+3500},TIMEOUTS.openCall);if(opened?.error)throw Error(opened.error);}catch(e){
     // A navigation can close the message port. Other errors are fatal.
     if(!/message port closed|channel closed|frame was removed|port is disconnected/i.test(e.message))throw e;
    }
-   const sendData={key:candidate.key,runId:run.id,title:job.title,city:job.city,salary:job.salary,company:job.company,companyKey:job.companyKey,companyAliases:job.companyAliases,recruiterName:job.recruiterName,recruiterCompany:job.recruiterCompany,recruiterRole:job.recruiterRole,message:c.message,allowConversationSelection:false};
    // If the site's own click leaves the dedicated task tab on the detail page,
    // use the button's pre-validated directed URL once in that same tab. Never
    // pick an older generic chat tab, where another recruiter may be selected.
    await enterDirectedChat(run,job);
-   // A full directed reload can render a selected-looking header/editor before
-   // the site's public conversation click has initialized its send state. For
-   // that fallback only, click one exact recruiter tuple once, then re-run all
-   // existing job/recipient checks. Native site navigation needs no extra click.
-   sendData.allowConversationSelection=run.navigation?.method==='official-directed-url';
+   // A selected-looking header/editor does not prove that the site's public
+   // conversation click initialized its send state. Every confirmed native or
+   // official route therefore activates one exact recruiter tuple once, then
+   // re-runs all existing job/recipient checks before any editor write.
+   if(!conversationActivationRequired(run.navigation))throw failure('CHAT_ROUTE_UNCONFIRMED','聊天路由未达到可执行精确联系人激活的确认状态，已停止且不会发送消息');
+   sendData.allowConversationSelection=true;
+   sendData.requireConversationActivation=true;
    sendData.requireIdentityStability=true;
    await phase(run,'chat-readiness','正在核对该岗位聊天对象和输入区域；不会发送到未核对对象');
    await read(run,'chatReady',sendData);
    await phase(run,'send-once',`聊天对象已核对；正在执行一次原话术发送：${job.title}`);
    const result=await sendOnce(run,sendData);
-   if(result.status==='sent'){await put(candidate.key,{status:'sent',receipt:result.receipt,confirmation:'fresh-connected-bubble+cleared-editor+explicit-public-receipt'});sent++;await log(`页面确认${result.receipt==='read'?'已读':'送达'}：${job.city} / ${job.title}`);}
-   else if(result.status==='existing'){await put(candidate.key,{status:'existing',reason:'会话中已经存在完整的当前原话术，未重复发送'});await log(`未重复：${job.title}，会话中已存在完整原话术`);}
-   else if(result.status==='existing-other'){await put(candidate.key,{status:'existing',reason:'会话中已有其他我方消息，未追加原话术'});await log(`未追加：${job.title}，会话中已有其他我方消息`);}
-   else{await put(candidate.key,{status:'unknown',reason:result.reason||'发送回执不明'});throw Error(result.reason||'发送回执不明，已停止且不会自动重发');}
-   run.pending=null;run.currentJob=null;await wait(run,c.interval*1000);
+   if(result.status==='sent'){await put(candidate.key,{status:'sent',receipt:result.receipt,confirmation:'fresh-connected-bubble+cleared-editor+explicit-public-receipt'});run.pending=null;sent++;run.summary.counts.sentConfirmed++;run.summary.counts.sentByCity[job.city]++;await saveRunSummary(run);await log(`页面确认${result.receipt==='read'?'已读':'送达'}：${job.city} / ${job.title}`);}
+   else if(result.status==='existing'){await put(candidate.key,{status:'existing',reason:'会话中已经存在完整的当前原话术，未重复发送'});run.pending=null;run.summary.counts.existingConversationMessages++;await saveRunSummary(run);await log(`未重复：${job.title}，会话中已存在完整原话术`);}
+   else if(result.status==='existing-other'){await put(candidate.key,{status:'existing',reason:'会话中已有其他我方消息，未追加原话术'});run.pending=null;run.summary.counts.existingConversationMessages++;await saveRunSummary(run);await log(`未追加：${job.title}，会话中已有其他我方消息`);}
+   else{await put(candidate.key,{status:'unknown',reason:result.reason||'发送回执不明'});throw unknownSendFailure(result);}
+   run.currentJob=null;await wait(run,c.interval*1000);
   }
-  await status(`${run.dry?'预览结束':'本批结束'}：筛选符合 ${processed}，页面确认已发 ${sent}，已尝试 ${attempted}。${run.scanPartial?'\n部分后续列表因纯读取失败未纳入；已使用此前候选完成本批。':''}\n详细结果可导出；页面确认不等于对方已读。`,false,run);
+  await finishRunSummary(run,'completed');
+  await status(`${run.dry?'预览结束':'本批结束'}：筛选符合 ${processed}，页面确认已发 ${sent}，已尝试 ${attempted}，发送前安全跳过 ${skippedUnsafe}。${run.scanPartial?'\n部分后续列表因纯读取失败未纳入；已使用此前候选完成本批。':''}\n详细结果可导出；页面确认不等于对方已读。`,false,run);
  }catch(e){
   const stopped=e.code==='STOPPED'||!run.running;
   // Revoke authorization before any diagnostic/storage work. This preserves the
   // original failure classification while preventing a late content response
   // from advancing into open/send during catch cleanup.
   cancel(run);cancelContent(run);
-  const safetyDiagnostic=stopped?null:run.lastSafety?{version:'0.1.11',safety:run.lastSafety,candidate:run.lastSafetyCandidate||null}:await captureSafetyContext(run);
+  const safetyDiagnostic=stopped?null:run.lastSafety?{version:'0.1.12',safety:run.lastSafety,candidate:run.lastSafetyCandidate||null}:await captureSafetyContext(run);
   const baseReason=stopped?'已停止：已撤销仍在等待的页面读取和后续发送授权；已经点击的“立即沟通”或发送动作无法撤回。':e.message;
   const reason=safetyDiagnostic?`${baseReason}\n已记录安全诊断：${safetyDiagnostic.safety.source} ${safetyDiagnostic.safety.pathname}；该记录不表示账号已退出。`:baseReason;
+  if(run.pending){run.summary.counts.unknown++;if(run.pending.city)run.summary.counts.unknownByCity[run.pending.city]++;}
   const diagnostic=runDiagnostic(run,{errorCode:e.code||'UNCLASSIFIED',errorDetails:e.details||null,stopped});
   if(run.pending)await put(run.pending.key,{status:'unknown',reason,diagnostic,safetyDiagnostic:safetyDiagnostic||undefined});
+  await finishRunSummary(run,stopped?'stopped':'failed',e.code||'UNCLASSIFIED',reason);
   await chrome.storage.local.set({lastFailure:{time:new Date().toISOString(),reason,diagnostic,safetyDiagnostic:safetyDiagnostic||null,currentJob:run.currentJob||null}});
   await log(reason);if(activeRun===run)await status(reason,false,run);
  }
@@ -399,11 +464,11 @@ chrome.runtime.onMessage.addListener((msg,sender,respond)=>{
    c.hangzhouPercent=10;await chrome.storage.local.set({config:c});
    const firstCity=Object.keys(BossCore.CITIES)[0],initialUrl=new URL('https://www.zhipin.com/web/geek/jobs');initialUrl.searchParams.set('query',c.keywords[0]);initialUrl.searchParams.set('city',BossCore.CITIES[firstCity]);
    const t=await passiveBounded(chrome.tabs.create({url:initialUrl.href,active:true}),TIMEOUTS.tabUpdate,'工作标签创建');
-   const r={id:crypto.randomUUID(),running:true,config:c,dry:!!msg.dry,tab:t.id,initialScanUrl:initialUrl.href,initialScanUrlUsed:false,pending:null,currentJob:null,lastSafety:null,lastSafetyCandidate:null};activeRun=r;
-   ensureCancellation(r);await status('准备中…',true,r);r.done=execute(r);return {ok:true};
+   const r={id:crypto.randomUUID(),running:true,config:c,dry:!!msg.dry,tab:t.id,initialScanUrl:initialUrl.href,initialScanUrlUsed:false,pending:null,currentJob:null,lastSafety:null,lastSafetyCandidate:null};r.summary=createRunSummary(r);activeRun=r;
+   ensureCancellation(r);await saveRunSummary(r);await status('准备中…',true,r);r.done=execute(r);return {ok:true};
   }
   return {error:'未知操作'};
  })().then(respond).catch(e=>respond({error:e.message}));return true;
 });
 // Worker/browser restart never silently resumes a job or a pending send.
-chrome.storage.local.get('state').then(async({state})=>{if(state?.running&&!activeRun)await status('上次任务已中断，请检查记录后重新启动；未确认的消息不自动重发',false);});
+chrome.storage.local.get(['state','lastRunSummary']).then(async({state,lastRunSummary})=>{if(state?.running&&!activeRun){if(lastRunSummary?.outcome==='running'){lastRunSummary.outcome='interrupted';lastRunSummary.reasonCode='WORKER_RESTART';lastRunSummary.reason='扩展后台中断；不会自动恢复，未确认动作不会重试';lastRunSummary.finishedAt=new Date().toISOString();await chrome.storage.local.set({lastRunSummary});}await status('上次任务已中断，请检查记录后重新启动；未确认的消息不自动重发',false);}});

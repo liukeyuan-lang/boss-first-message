@@ -1,1 +1,1 @@
-{"name":"boss-first-message-local","private":true,"version":"0.1.11","scripts":{"test":"node TESTS.cjs"},"devDependencies":{"jsdom":"26.1.0"}}
+{"name":"boss-first-message-local","private":true,"version":"0.1.12","scripts":{"test":"node TESTS.cjs"},"devDependencies":{"jsdom":"26.1.0"}}

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "岗位筛选与首次招呼",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "description": "本地筛选 AI 产品、FDE、AI 解决方案、AIGC 岗位；只发送预设招呼。",
   "permissions": [
     "storage",

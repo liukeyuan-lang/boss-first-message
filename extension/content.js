@@ -1,6 +1,6 @@
 'use strict';
 (()=>{
-const C=BossCore;let sending=false;const cancelledRuns=new Set(),conversationSelectionRuns=new Set(),conversationSelectionStates=new Map();
+const C=BossCore;let sending=false;const cancelledRuns=new Set(),conversationSelectionRuns=new Set(),conversationSelectionStates=new Map(),openPreflightStates=new Map();
 // The receiver is installed at document_start, before the site's deferred
 // scripts bind its visible SSR controls. A painted button is not interactive yet.
 let documentInteractive=document.readyState!=='loading';
@@ -53,7 +53,7 @@ function communicationTarget(value){
 }
 function safetyDiagnostic(m={}){
  const safety=safetyState();
- return {version:'0.1.11',safety:safety||{pathname:safePath(),source:null,routeType:null,visibleBlockingTypes:[],visibleBlockingElementCount:0,visibleBlockingClasses:[]},candidate:m?.candidate?{jobPath:canonicalJobPath(m.candidate.jobPath),title:String(m.candidate.title||'').slice(0,160)}:null,note:'只读安全诊断：仅保存路径（不含查询参数或片段）、路由/可见阻断类型、可见元素计数和 CSS 类名；不读取输入框、账号、密码、验证码、Cookie、LocalStorage 或聊天内容。没有点击或发送。'};
+ return {version:'0.1.12',safety:safety||{pathname:safePath(),source:null,routeType:null,visibleBlockingTypes:[],visibleBlockingElementCount:0,visibleBlockingClasses:[]},candidate:m?.candidate?{jobPath:canonicalJobPath(m.candidate.jobPath),title:String(m.candidate.title||'').slice(0,160)}:null,note:'只读安全诊断：仅保存路径（不含查询参数或片段）、路由/可见阻断类型、可见元素计数和 CSS 类名；不读取输入框、账号、密码、验证码、Cookie、LocalStorage 或聊天内容。没有点击或发送。'};
 }
 function guard(){
  const safety=safetyState();if(!safety)return;
@@ -62,7 +62,10 @@ function guard(){
 }
 function fresh(m){if(Number.isFinite(m.expiresAt)&&Date.now()>=m.expiresAt)throw Error('命令已过期，已停止且不会执行迟到动作');}
 async function allowed(m){guard();fresh(m);if(cancelledRuns.has(m.runId))throw Error('任务已停止或当前会话未获授权');const a=await chrome.runtime.sendMessage({type:'authorize',key:m.key,runId:m.runId});fresh(m);if(cancelledRuns.has(m.runId)||!a?.ok)throw Error('任务已停止或当前会话未获授权');}
-function cancelRun(m){if(typeof m.runId==='string'){cancelledRuns.add(m.runId);conversationSelectionRuns.delete(m.runId);conversationSelectionStates.delete(m.runId);while(cancelledRuns.size>50)cancelledRuns.delete(cancelledRuns.values().next().value);}return {ok:true};}
+function conversationScope(m){return typeof m.runId==='string'&&typeof m.key==='string'?`${m.runId}\n${m.key}`:null;}
+function trimStateMap(map,max=200){while(map.size>max)map.delete(map.keys().next().value);}
+function clearConversationRun(runId){for(const key of conversationSelectionRuns)if(key.startsWith(`${runId}\n`))conversationSelectionRuns.delete(key);for(const key of conversationSelectionStates.keys())if(key.startsWith(`${runId}\n`))conversationSelectionStates.delete(key);for(const key of openPreflightStates.keys())if(key.startsWith(`${runId}\n`))openPreflightStates.delete(key);}
+function cancelRun(m){if(typeof m.runId==='string'){cancelledRuns.add(m.runId);clearConversationRun(m.runId);while(cancelledRuns.size>50)cancelledRuns.delete(cancelledRuns.values().next().value);}return {ok:true};}
 function outgoing(){return [...document.querySelectorAll('.chat-message .item-myself')].filter(visible);}
 function outgoingBody(bubble){return bubble?.querySelector('.message-content')||null;}
 const RECEIPT_CLASS=/(?:^|\s)(?:message-status|status-(?:delivery|read|unread|sending|fail|error)|send-(?:success|fail|error)|retry)(?:\s|$)/;
@@ -117,6 +120,13 @@ function outgoingReceipt(bubble){
  if(labels.concat(leaves).some(value=>/^(?:已读|read)$/i.test(value)))return 'read';
  if(labels.concat(leaves).some(value=>/^(?:送达|已送达|delivered)$/i.test(value)))return 'delivered';
  return null;
+}
+const SEND_STATUS_TOKEN=/^(?:message-status|status-(?:delivery|read|unread|sending|loading|fail|error)|send-(?:success|fail|error)|retry|error)$/;
+function sendStateObservation(bubble,input,identityStable=true){
+ const statusClasses=bubble?[...new Set([...bubble.querySelectorAll('[class]')].flatMap(node=>[...node.classList]).filter(token=>SEND_STATUS_TOKEN.test(token)))].slice(0,12):[];
+ const editorPresent=!!input?.isConnected;
+ const draft=editorPresent?(input instanceof HTMLTextAreaElement||input instanceof HTMLInputElement?input.value:input.textContent):null;
+ return {exactMessageBubble:!!bubble,bubbleConnected:!!bubble?.isConnected,editorPresent,editorEmpty:editorPresent&&!C.norm(draft),receipt:outgoingReceipt(bubble),failureMarker:failedOutgoing(bubble),identityStable:!!identityStable,statusClasses};
 }
 function genuineOutgoing(){
  return outgoing().filter(e=>{
@@ -313,7 +323,7 @@ function diagnose(m={}){
  const startChat=location.pathname.startsWith('/job_detail/')?one('.btn-startchat'):null;
  const target=location.pathname.startsWith('/job_detail/')?communicationTarget(startChat?.getAttribute('redirect-url')):undefined;
  const companySelectorCounts=location.pathname.startsWith('/job_detail/')?Object.fromEntries(COMPANY_SELECTORS.split(',').map(x=>[x,document.querySelectorAll(x).length])):undefined;
- return {version:'0.1.11',pagePath:location.pathname,counts:Object.fromEntries(selectors.map(x=>[x,document.querySelectorAll(x).length])),scan:cardSummary(allCards),companySelectorCounts,cards:candidates.map(e=>({city:locationCity(e),structure:tree(e)})),company:identity?{name:identity.company||null,candidates:identity.companyCandidates||[],source:identity.companySource||null,aliasReason:identity.companyAliasReason||null,issue:identity.companyIssue||null,evidence:identity.companyEvidence||[]}:undefined,jobPublic:bossRoot?{salary,recruiterStructure:publicDetailTree(bossRoot),communicationTarget:target}:undefined,note:'只读的岗位卡片与公司及招聘者公开字段识别结果，不含 Cookie、LocalStorage、密码、聊天记录或 URL 查询参数。聊天地址只输出路径和参数名分类，不输出参数值或完整查询串；公司证据只含公开名称、来源容器和公司链接路径。没有点击或发送。'};
+ return {version:'0.1.12',pagePath:location.pathname,counts:Object.fromEntries(selectors.map(x=>[x,document.querySelectorAll(x).length])),scan:cardSummary(allCards),companySelectorCounts,cards:candidates.map(e=>({city:locationCity(e),structure:tree(e)})),company:identity?{name:identity.company||null,candidates:identity.companyCandidates||[],source:identity.companySource||null,aliasReason:identity.companyAliasReason||null,issue:identity.companyIssue||null,evidence:identity.companyEvidence||[]}:undefined,jobPublic:bossRoot?{salary,recruiterStructure:publicDetailTree(bossRoot),communicationTarget:target}:undefined,note:'只读的岗位卡片与公司及招聘者公开字段识别结果，不含 Cookie、LocalStorage、密码、聊天记录或 URL 查询参数。聊天地址只输出路径和参数名分类，不输出参数值或完整查询串；公司证据只含公开名称、来源容器和公司链接路径。没有点击或发送。'};
 }
 
 function diagnoseChat(m={}){
@@ -400,15 +410,15 @@ function diagnoseChat(m={}){
   return {...attr(frame),srcPath};
  });
  const expectedSalary=typeof m.expectedSalary==='string'?m.expectedSalary:null;
- const salaryNodes=header.length===1?[...header[0].querySelectorAll('.salary,.job-salary')].filter(visible):[];
- const currentSalary=salaryNodes.length===1?text(salaryNodes[0]):null;
- const selectionState=typeof m.runId==='string'?conversationSelectionStates.get(m.runId):null;
+ const fields=chatJobPublicFields(header.length===1?header[0]:null);
+ const scope=conversationScope(m),selectionState=scope?conversationSelectionStates.get(scope):null;
+ const publicFieldComparisons={title:publicFieldComparison(fields.title,m.expectedTitle,jobTitleKey),salary:publicFieldComparison(fields.salary,expectedSalary,C.norm),city:publicFieldComparison(fields.city,m.expectedCity),company:publicFieldComparison(fields.company,m.expectedCompany,C.companyKey)};
  return {
-  version:'0.1.11',pagePath:location.pathname,
+  version:'0.1.12',pagePath:location.pathname,
   counts:Object.fromEntries(selectors.map(x=>[x,document.querySelectorAll(x).length])),
   input:shell(input),sendButton:shell(sendButton),jobDetailControls:header.map(control=>({...shell(control),viewAction:shell(jobViewAction(control))})),
-  selectedJob:{controlText:exactHeaderText,jobPaths:jobLinks},
-  salaryComparison:{expected:expectedSalary,current:currentSalary,nodeCount:salaryNodes.length,expectedCodePoints:codePoints(expectedSalary),currentCodePoints:codePoints(currentSalary),normalizedMatch:expectedSalary!==null&&salaryNodes.length===1&&C.norm(currentSalary)===C.norm(expectedSalary),currentHasPrivateUseCharacters:hasPrivateUseCharacters(currentSalary),identitySettleSource:selectionState?.source||null,identitySettleElapsedMs:selectionState?Math.max(0,Date.now()-selectionState.startedAt):null,selectionElapsedMs:selectionState?.source==='conversation-selection'?Math.max(0,Date.now()-selectionState.startedAt):null,stableSnapshotReads:selectionState?.reads||0,stableSnapshotReady:!!selectionState?.settled},
+  selectedJob:{controlText:exactHeaderText,jobPaths:jobLinks,publicFields:publicFieldComparisons},
+  salaryComparison:{...publicFieldComparisons.salary,identitySettleSource:selectionState?.source||null,identitySettleElapsedMs:selectionState?Math.max(0,Date.now()-selectionState.startedAt):null,selectionElapsedMs:selectionState?.source==='conversation-selection'?Math.max(0,Date.now()-selectionState.startedAt):null,stableSnapshotReads:selectionState?.reads||0,stableSnapshotReady:!!selectionState?.settled},
   selectedPublicHeader:selectedTop?publicTree(selectedTop):null,
   selectedConversationEntry:selectedEntry?selectedEntryTree(selectedEntry):null,
   outgoingShape:{total:outgoingNodes.length,genuine:genuineOutgoing().length,substantive:genuineOutgoing().length,withMessageContent:outgoingNodes.filter(e=>e.querySelector('.message-content')).length,withTextNode:outgoingNodes.filter(e=>e.querySelector('.message-content .text')).length,withSystemCard:outgoingNodes.filter(e=>!e.querySelector('.message-content')&&/你与该职位竞争者PK情况/.test(text(e))).length,receiptShape},
@@ -417,7 +427,7 @@ function diagnoseChat(m={}){
  };
 }
 
-function detail(){
+function detail(m={}){
  guard();if(!documentInteractive)return {wait:true,reason:'岗位详情仍在初始化页面交互'};const title=text(one('.job-banner h1,.job-primary h1,.name h1'));const jd=text(one('.job-sec-text'));if(!title||!jd)return {wait:true,reason:'岗位详情内容尚未加载'};
  const city=C.cityOf(text(one('.job-banner .text-city,.job-primary .text-city,.job-banner .job-area,.job-primary .job-area')));
  const salary=text(one('.job-banner .salary,.job-primary .salary,.job-banner .job-salary,.job-primary .job-salary'))||null;
@@ -431,24 +441,73 @@ function detail(){
  const recruiterRole=recruiterMeta.length===2?recruiterMeta[1]:null;
  const identity=companyIdentity();
  const btn=one('.btn-startchat');const chatUrl=btn?.getAttribute('redirect-url');let full=null;try{if(chatUrl)full=new URL(chatUrl,location.origin).href;}catch{}
- return {title,jd,city,salary,recruiterName,recruiterCompany,recruiterRole,...identity,url:location.href,talked:btn?.dataset.isfriend==='true'||/继续沟通/.test(text(btn)),chatUrl:full,communicationTarget:communicationTarget(full)};
+ const result={title,jd,city,salary,recruiterName,recruiterCompany,recruiterRole,...identity,url:location.href,talked:btn?.dataset.isfriend==='true'||/继续沟通/.test(text(btn)),chatUrl:full,communicationTarget:communicationTarget(full)};
+ if(m.requireSendIdentity&&!result.talked){
+  const missing=[!result.city&&'城市',!result.salary&&'薪资',!result.companyKey&&!result.companyIssue&&'公司',!result.recruiterName&&'招聘者姓名',!result.recruiterCompany&&'招聘者机构',!result.recruiterRole&&'招聘者身份',!result.chatUrl&&'官方聊天地址'].filter(Boolean);
+  if(missing.length)return {wait:true,reason:`岗位详情发送前公开字段尚未完整加载：${missing.join('、')}`};
+ }
+ return result;
 }
-async function open(m){await allowed(m);if(!documentInteractive)throw Error('岗位详情交互尚未初始化，未点击沟通');if(C.key(location.href)!==m.key)throw Error('详情页与待投岗位不符');const btn=one('.btn-startchat');if(!btn||text(btn)!=='立即沟通')throw Error('未找到唯一的立即沟通按钮或岗位已沟通');if(btn.dataset.isfriend==='true')throw Error('该岗位已沟通过');await allowed(m);fresh(m);btn.click();return {ok:true};}
+function openPreflightSnapshot(m){
+ const job=detail();if(job.wait)return job;
+ if(C.key(job.url)!==m.key)throw Error('发送前岗位详情与待投岗位不符');
+ const mismatches=[jobTitleKey(job.title)!==jobTitleKey(m.title)&&'岗位名称',job.city!==m.city&&'城市',C.norm(job.salary)!==C.norm(m.salary)&&'薪资',job.companyKey!==m.companyKey&&'公司',job.recruiterName!==m.recruiterName&&'招聘者姓名',job.recruiterCompany!==m.recruiterCompany&&'招聘者机构',job.recruiterRole!==m.recruiterRole&&'招聘者身份'].filter(Boolean);
+ if(mismatches.length)throw Error(`发送前岗位详情公开字段发生变化（${mismatches.join('、')}），已停止`);
+ const buttons=[...document.querySelectorAll('.btn-startchat')].filter(visible),btn=buttons.length===1?buttons[0]:null;if(!btn||text(btn)!=='立即沟通'||btn.dataset.isfriend==='true'||job.talked)throw Error('发送前岗位已不是唯一可用的“立即沟通”状态，已停止');
+ if(!job.communicationTarget?.directionSufficient)throw Error('发送前岗位官方聊天地址不再包含明确定向字段，已停止');
+ return {fingerprint:JSON.stringify({key:m.key,title:jobTitleKey(job.title),city:job.city,salary:C.norm(job.salary),companyKey:job.companyKey,recruiterName:job.recruiterName,recruiterCompany:job.recruiterCompany,recruiterRole:job.recruiterRole,buttonText:text(btn),targetPath:job.communicationTarget.redirectPath,targetFields:job.communicationTarget.targetParamNames})};
+}
+function openPreflight(m){
+ guard();fresh(m);if(!documentInteractive)return {wait:true,reason:'岗位详情交互仍在初始化'};
+ const scope=conversationScope(m);if(!scope)throw Error('发送前岗位任务标识缺失，已停止');
+ const snapshot=openPreflightSnapshot(m);if(snapshot.wait)return snapshot;
+ let state=openPreflightStates.get(scope);if(!state||state.fingerprint!==snapshot.fingerprint){state={fingerprint:snapshot.fingerprint,startedAt:Date.now(),reads:1,ready:false};openPreflightStates.set(scope,state);trimStateMap(openPreflightStates);return {wait:true,reason:'正在等待岗位详情与“立即沟通”控件稳定'};}
+ state.reads++;const elapsedMs=Math.max(0,Date.now()-state.startedAt);if(state.reads<2||elapsedMs<1000)return {wait:true,reason:'正在等待岗位详情与“立即沟通”控件稳定'};
+ state.ready=true;state.elapsedMs=elapsedMs;return {ready:true,stableSnapshotReads:state.reads,elapsedMs,pagePath:safePath()};
+}
+async function open(m){
+ await allowed(m);
+ const currentButton=()=>{
+  if(!documentInteractive)throw Error('岗位详情交互尚未初始化，未点击沟通');
+  if(C.key(location.href)!==m.key)throw Error('详情页与待投岗位不符');
+  if(m.requireStablePreflight){const scope=conversationScope(m),state=scope?openPreflightStates.get(scope):null;if(!state?.ready||openPreflightSnapshot(m).fingerprint!==state.fingerprint)throw Error('岗位详情未通过稳定交互预检或预检后发生变化，未点击沟通');}
+  const buttons=[...document.querySelectorAll('.btn-startchat')].filter(visible),btn=buttons.length===1?buttons[0]:null;
+  if(!btn||text(btn)!=='立即沟通')throw Error('未找到唯一的立即沟通按钮或岗位已沟通');
+  if(btn.dataset.isfriend==='true')throw Error('该岗位已沟通过');
+  return btn;
+ };
+ currentButton();
+ // Authorization is asynchronous and the SPA may replace the button while it
+ // is pending. Re-read every public field and the connected button after the
+ // final authorization, then click that current node without another await.
+ await allowed(m);fresh(m);currentButton().click();return {ok:true};
+}
 function openReady(m){
  guard();
  if(C.key(location.href)!==m.key)return {wait:true,reason:'任务标签正在离开岗位详情',pagePath:safePath()};
- const btn=one('.btn-startchat');
- if(!btn)return {wait:true,reason:'沟通按钮尚未加载',pagePath:safePath()};
+ const buttons=[...document.querySelectorAll('.btn-startchat')].filter(visible),btn=buttons.length===1?buttons[0]:null;
+ if(!btn)return {wait:true,reason:buttons.length?'当前详情出现多个可见沟通按钮':'沟通按钮尚未加载',pagePath:safePath(),buttonState:{visibleCount:buttons.length,text:null,isFriend:null}};
  const opened=btn.dataset.isfriend==='true'||/继续沟通/.test(text(btn));
- return opened?{opened:true,pagePath:safePath()}:{wait:true,reason:'网站尚未公开确认已建立沟通',pagePath:safePath()};
-}
-function identityParts(root){
- const parts=[];const add=value=>String(value||'').split(/[\n\r\t·・•｜|]+/).map(x=>x.trim()).filter(Boolean).forEach(x=>parts.push(x));
- add(text(root));
- for(const el of root.querySelectorAll('*'))if(!el.children.length&&visible(el))add(text(el));
- return [...new Set(parts)];
+ const buttonState={visibleCount:1,text:text(btn),isFriend:btn.dataset.isfriend==='true'};
+ return opened?{opened:true,pagePath:safePath(),buttonState}:{wait:true,reason:'网站尚未公开确认已建立沟通',pagePath:safePath(),buttonState};
 }
 function jobTitleKey(value){return C.norm(String(value||'').normalize('NFKC').replace(/[（(]猎头职位[）)]$/,'').trim());}
+const CHAT_JOB_FIELD_SELECTORS={
+ title:'.position-name,.job-name,.job-title-name',
+ salary:'.salary,.job-salary',
+ city:'.city,.job-city,.position-city',
+ company:'.company-name,.job-company,.position-company'
+};
+function typedPublicField(control,selector){
+ const nodes=control?[...(control.matches?.(selector)?[control]:[]),...control.querySelectorAll(selector)].filter(visible):[];
+ const values=[...new Set(nodes.map(text).filter(Boolean))];
+ return {value:nodes.length===1&&values.length===1?values[0]:null,nodeCount:nodes.length,distinctValues:values,ambiguous:nodes.length>1||values.length>1,hasPrivateUseCharacters:values.some(hasPrivateUseCharacters)};
+}
+function chatJobPublicFields(control){return Object.fromEntries(Object.entries(CHAT_JOB_FIELD_SELECTORS).map(([name,selector])=>[name,typedPublicField(control,selector)]));}
+function publicFieldComparison(field,expected,normalizer=value=>String(value||'')){
+ const expectedValue=typeof expected==='string'?expected:null,current=field?.value||null;
+ return {expected:expectedValue,current,nodeCount:field?.nodeCount||0,distinctValues:field?.distinctValues||[],ambiguous:!!field?.ambiguous,expectedCodePoints:codePoints(expectedValue),currentCodePoints:codePoints(current),normalizedMatch:expectedValue!==null&&current!==null&&normalizer(current)===normalizer(expectedValue),currentHasPrivateUseCharacters:!!field?.hasPrivateUseCharacters};
+}
 function jobViewAction(control){
  const exact=[...control.querySelectorAll('*')].filter(e=>visible(e)&&text(e)==='查看职位');
  const deepest=exact.filter(e=>![...e.querySelectorAll('*')].some(child=>visible(child)&&text(child)==='查看职位'));
@@ -458,7 +517,6 @@ function chatIdentityObservation(m){
  const controls=[...document.querySelectorAll('[ka="geek_chat_job_detail"]')].filter(visible);
  const control=controls.length===1?controls[0]:null;
  const top=control?.closest('.top-info-content')||null;
- const roots=control?[...new Set([control,control.parentElement,control.parentElement?.parentElement,top].filter(Boolean))]:[];
  const anchors=[];
  if(control){
   if(control instanceof HTMLAnchorElement)anchors.push(control);
@@ -467,23 +525,22 @@ function chatIdentityObservation(m){
   if(control.parentElement)anchors.push(...control.parentElement.querySelectorAll('a[href]'));
  }
  const jobKeys=[...new Set(anchors.map(a=>C.key(a.href)).filter(Boolean))].sort();
- const parts=[...new Set(roots.flatMap(identityParts))].sort();
- const salaryNodes=control?[...control.querySelectorAll('.salary,.job-salary')].filter(visible):[];
- const currentSalary=salaryNodes.length===1?text(salaryNodes[0]):null;
+ const fields=chatJobPublicFields(control);
  const selectedEntries=[...document.querySelectorAll('.friend-content.selected')].filter(visible);
  const selectedIdentity=selectedEntries.length===1?conversationEntryIdentity(selectedEntries[0]):null;
- const publicValues={controlCount:controls.length,jobKeys,parts,salaries:salaryNodes.map(text),selectedEntryCount:selectedEntries.length,selectedIdentity,headerName:text(top?.querySelector('.user-info .name-text')),headerRole:text(top?.querySelector('.user-info .base-title'))};
- return {fingerprint:JSON.stringify(publicValues),salaryComparison:{expected:m.salary||null,current:currentSalary,nodeCount:salaryNodes.length,expectedCodePoints:codePoints(m.salary),currentCodePoints:codePoints(currentSalary),normalizedMatch:!!m.salary&&salaryNodes.length===1&&C.norm(currentSalary)===C.norm(m.salary),currentHasPrivateUseCharacters:hasPrivateUseCharacters(currentSalary)}};
+ const publicValues={controlCount:controls.length,jobKeys,fields,selectedEntryCount:selectedEntries.length,selectedIdentity,headerName:text(top?.querySelector('.user-info .name-text')),headerRole:text(top?.querySelector('.user-info .base-title'))};
+ return {fingerprint:JSON.stringify(publicValues),fields,salaryComparison:publicFieldComparison(fields.salary,m.salary,C.norm)};
 }
 function selectedIdentityStable(m){
- const selected=typeof m.runId==='string'&&conversationSelectionRuns.has(m.runId);
- if(typeof m.runId!=='string'||(!selected&&!m.requireIdentityStability))return {stable:true,identitySettleElapsedMs:null};
+ const scope=conversationScope(m),selected=!!scope&&conversationSelectionRuns.has(scope);
+ if(!scope||(!selected&&!m.requireIdentityStability))return {stable:true,identitySettleElapsedMs:null};
  const observation=chatIdentityObservation(m);
- let state=conversationSelectionStates.get(m.runId);
- if(!state){state={startedAt:Date.now(),source:selected?'conversation-selection':'fresh-navigation',fingerprint:null,reads:0,settled:false};conversationSelectionStates.set(m.runId,state);}
+ let state=conversationSelectionStates.get(scope);
+ if(!state){state={startedAt:Date.now(),source:selected?'conversation-selection':'fresh-navigation',fingerprint:null,reads:0,settled:false};conversationSelectionStates.set(scope,state);trimStateMap(conversationSelectionStates);}
  if(state.fingerprint!==observation.fingerprint){state.fingerprint=observation.fingerprint;state.reads=1;state.settled=false;}else state.reads++;
  const identitySettleElapsedMs=Math.max(0,Date.now()-state.startedAt);
- if(observation.salaryComparison.currentHasPrivateUseCharacters)return {wait:true,reason:'当前聊天薪资公开文本仍含不可直接读取的页面字体字形，正在等待可核对文本',identityDiagnostic:{mismatchFields:['薪资不可读'],salaryComparison:observation.salaryComparison,identitySettleSource:state.source,identitySettleElapsedMs,selectionElapsedMs:state.source==='conversation-selection'?identitySettleElapsedMs:null,stableSnapshotReads:state.reads,stableSnapshotReady:false}};
+ const unreadableFields=Object.entries(observation.fields).filter(([,field])=>field.hasPrivateUseCharacters).map(([name])=>({title:'岗位名称',salary:'薪资',city:'城市',company:'公司'}[name]));
+ if(unreadableFields.length)return {wait:true,reason:`当前聊天${unreadableFields.join('、')}公开文本仍含不可直接读取的页面字体字形，正在等待可核对文本`,identityDiagnostic:{mismatchFields:unreadableFields.map(name=>`${name}不可读`),publicFields:observation.fields,salaryComparison:observation.salaryComparison,identitySettleSource:state.source,identitySettleElapsedMs,selectionElapsedMs:state.source==='conversation-selection'?identitySettleElapsedMs:null,stableSnapshotReads:state.reads,stableSnapshotReady:false}};
  if(state.reads<2)return {wait:true,reason:state.source==='conversation-selection'?'唯一联系人已选择，正在等待职位与招聘者公开身份字段稳定':'正在等待新聊天页的职位与招聘者公开身份字段稳定'};
  state.settled=true;return {stable:true,identitySettleElapsedMs};
 }
@@ -492,7 +549,6 @@ function scopedChatIdentity(m){
  if(!controls.length)return {wait:true,reason:'当前聊天的职位控件尚未加载'};
  if(controls.length!==1)throw Error('当前聊天出现多个职位控件，无法唯一核对，已停止');
  const top=controls[0].closest('.top-info-content');
- const roots=[...new Set(controls.flatMap(e=>[e,e.parentElement,e.parentElement?.parentElement,top]).filter(Boolean))];
  const anchors=[];
  for(const control of controls){
   if(control instanceof HTMLAnchorElement)anchors.push(control);
@@ -501,23 +557,22 @@ function scopedChatIdentity(m){
   if(control.parentElement)anchors.push(...control.parentElement.querySelectorAll('a[href]'));
  }
  const jobKeys=[...new Set(anchors.map(a=>C.key(a.href)).filter(Boolean))];
- const parts=[...new Set(roots.flatMap(identityParts))];
+ const fields=chatJobPublicFields(controls[0]);
  const aliases=Array.isArray(m.companyAliases)?m.companyAliases:[m.company];
  const companyKeys=[...new Set(aliases.map(C.companyKey).filter(Boolean))];
- const titleMatch=parts.some(part=>jobTitleKey(part)===jobTitleKey(m.title));
+ const titleMatch=fields.title.value!==null&&jobTitleKey(fields.title.value)===jobTitleKey(m.title);
  // Legal names and display brands are accepted only when detail() recorded both
  // as exact, page-bound aliases. This compares normalized whole names, never
  // prefixes or substrings.
- const companyMatch=parts.some(part=>companyKeys.includes(C.companyKey(part)));
- const cityMatch=parts.some(part=>part===m.city);
- // Keep the full compensation field intact: identityParts splits the middle
- // dot in values such as 30-55K·15薪, which otherwise makes equal pay fail.
- const salaryNodes=[...controls[0].querySelectorAll('.salary,.job-salary')].filter(visible);
- const state=typeof m.runId==='string'?conversationSelectionStates.get(m.runId):null;
- const salaryDiagnostic={expected:m.salary||null,current:salaryNodes.length===1?text(salaryNodes[0]):null,nodeCount:salaryNodes.length,expectedCodePoints:codePoints(m.salary),currentCodePoints:salaryNodes.length===1?codePoints(text(salaryNodes[0])):[],normalizedMatch:!!m.salary&&salaryNodes.length===1&&C.norm(text(salaryNodes[0]))===C.norm(m.salary),currentHasPrivateUseCharacters:salaryNodes.length===1&&hasPrivateUseCharacters(text(salaryNodes[0]))};
- const identityDiagnostic=missingFields=>({mismatchFields:missingFields,salaryComparison:salaryDiagnostic,identitySettleSource:state?.source||null,identitySettleElapsedMs:state?Math.max(0,Date.now()-state.startedAt):null,selectionElapsedMs:state?.source==='conversation-selection'?Math.max(0,Date.now()-state.startedAt):null,stableSnapshotReads:state?.reads||0,stableSnapshotReady:!!state?.settled});
- if(salaryDiagnostic.currentHasPrivateUseCharacters)return {wait:true,reason:'当前聊天薪资公开文本仍含不可直接读取的页面字体字形，正在等待可核对文本',identityDiagnostic:identityDiagnostic(['薪资不可读'])};
- const salaryMatch=!!m.salary&&salaryNodes.length===1&&C.norm(text(salaryNodes[0]))===C.norm(m.salary);
+ const companyMatch=fields.company.value!==null&&companyKeys.includes(C.companyKey(fields.company.value));
+ const cityMatch=fields.city.value===m.city;
+ const scope=conversationScope(m),state=scope?conversationSelectionStates.get(scope):null;
+ const publicFields={title:publicFieldComparison(fields.title,m.title,jobTitleKey),salary:publicFieldComparison(fields.salary,m.salary,C.norm),city:publicFieldComparison(fields.city,m.city),company:publicFieldComparison(fields.company,m.company,C.companyKey)};
+ const salaryDiagnostic=publicFields.salary;
+ const identityDiagnostic=missingFields=>({mismatchFields:missingFields,publicFields,salaryComparison:salaryDiagnostic,identitySettleSource:state?.source||null,identitySettleElapsedMs:state?Math.max(0,Date.now()-state.startedAt):null,selectionElapsedMs:state?.source==='conversation-selection'?Math.max(0,Date.now()-state.startedAt):null,stableSnapshotReads:state?.reads||0,stableSnapshotReady:!!state?.settled});
+ const unreadableFields=Object.entries(fields).filter(([,field])=>field.hasPrivateUseCharacters).map(([name])=>({title:'岗位名称',salary:'薪资',city:'城市',company:'公司'}[name]));
+ if(unreadableFields.length)return {wait:true,reason:`当前聊天${unreadableFields.join('、')}公开文本仍含不可直接读取的页面字体字形，正在等待可核对文本`,identityDiagnostic:identityDiagnostic(unreadableFields.map(name=>`${name}不可读`))};
+ const salaryMatch=salaryDiagnostic.normalizedMatch;
  const exactJobMatch=jobKeys.length===1&&jobKeys[0]===m.key;
  // An exact job-detail path is stronger than a company label: hunter jobs show
  // the recruiting agency in chat while the job detail names an anonymous client.
@@ -549,32 +604,50 @@ function conversationEntryIdentity(entry){
  const company=values.find(value=>value!==name)||null;
  return {name,company,role:values.find(value=>value!==name&&value!==company)||null};
 }
+function exactConversationMatches(m){
+ if(![m.recruiterName,m.recruiterCompany,m.recruiterRole].every(value=>typeof value==='string'&&value.trim()))return [];
+ return [...document.querySelectorAll('.friend-content')].filter(visible).filter(entry=>{
+  const identity=conversationEntryIdentity(entry);
+  return identity&&identity.name===m.recruiterName&&identity.company===m.recruiterCompany&&identity.role===m.recruiterRole;
+ });
+}
+function markConversationSelection(scope,activationClicked=false){conversationSelectionRuns.add(scope);conversationSelectionStates.set(scope,{startedAt:Date.now(),source:'conversation-selection',activationClicked,fingerprint:null,reads:0,settled:false});while(conversationSelectionRuns.size>50){const oldest=conversationSelectionRuns.values().next().value;conversationSelectionRuns.delete(oldest);conversationSelectionStates.delete(oldest);}}
+function requireConversationActivation(m){
+ if(!m.requireConversationActivation)return;
+ const scope=conversationScope(m),state=scope?conversationSelectionStates.get(scope):null;
+ if(!scope||!state?.activationClicked)throw Error('当前岗位会话未完成精确联系人激活，已停止');
+ const matches=exactConversationMatches(m);
+ if(matches.length!==1||!matches[0].classList.contains('selected'))throw Error('发送前精确联系人会话不再唯一选中，已停止');
+}
 async function selectExactConversation(m){
- if(!m.allowConversationSelection||typeof m.runId!=='string')return {wait:true,reason:'聊天输入框或消息区域尚未加载'};
- if(conversationSelectionRuns.has(m.runId))return {wait:true,reason:'已按招聘者公开身份选择一次会话，仍在等待输入区域加载'};
+ const scope=conversationScope(m);
+ if(!m.allowConversationSelection||!scope)return {wait:true,reason:'聊天输入框或消息区域尚未加载'};
+ if(conversationSelectionRuns.has(scope)){const state=conversationSelectionStates.get(scope);return {wait:true,conversationSelected:true,conversationActivated:state?.activationClicked===true,reason:'已按招聘者公开身份激活一次会话，仍在等待输入区域加载'};}
  const expected=[m.recruiterName,m.recruiterCompany,m.recruiterRole];
  if(!expected.every(value=>typeof value==='string'&&value.trim()))return {wait:true,reason:'缺少招聘者公开身份字段，不能选择会话'};
- const matches=[...document.querySelectorAll('.friend-content')].filter(visible).filter(entry=>{
-  const identity=conversationEntryIdentity(entry);
-  return identity&&identity.name===m.recruiterName&&identity.company===m.recruiterCompany&&identity.role===m.recruiterRole;
- });
+ const matches=exactConversationMatches(m);
  if(matches.length!==1)return {wait:true,reason:matches.length?'招聘者公开身份对应多个会话，不能唯一选择':'尚未出现与招聘者公开身份完全一致的会话'};
+ if(matches[0].classList.contains('selected')&&!m.requireConversationActivation){markConversationSelection(scope);return {wait:true,conversationSelected:true,conversationActivated:false,selectionAlreadyActive:true,reason:'目标招聘者会话已由网站选中，正在等待岗位与输入区域稳定'};}
  await allowed(m);guard();
- const currentMatches=[...document.querySelectorAll('.friend-content')].filter(visible).filter(entry=>{
-  const identity=conversationEntryIdentity(entry);
-  return identity&&identity.name===m.recruiterName&&identity.company===m.recruiterCompany&&identity.role===m.recruiterRole;
- });
+ const currentMatches=exactConversationMatches(m);
  if(currentMatches.length!==1)return {wait:true,reason:'授权后招聘者公开身份不再唯一，未选择会话'};
- conversationSelectionRuns.add(m.runId);conversationSelectionStates.set(m.runId,{startedAt:Date.now(),source:'conversation-selection',fingerprint:null,reads:0,settled:false});while(conversationSelectionRuns.size>50){const oldest=conversationSelectionRuns.values().next().value;conversationSelectionRuns.delete(oldest);conversationSelectionStates.delete(oldest);}
+ markConversationSelection(scope,false);
  fresh(m);currentMatches[0].click();
- return {wait:true,conversationSelected:true,reason:'已按招聘者姓名、机构和身份唯一选择新会话，正在等待岗位与输入区域加载'};
+ const state=conversationSelectionStates.get(scope);if(state)state.activationClicked=true;
+ return {wait:true,conversationSelected:true,conversationActivated:true,reason:'已按招聘者姓名、机构和身份唯一选择并激活一次会话，正在等待岗位与输入区域加载'};
+}
+function chatShellState(){
+ const visibleCount=selector=>[...document.querySelectorAll(selector)].filter(visible).length;
+ const state={inputCount:visibleCount('#chat-input'),historyCount:visibleCount('.chat-message'),jobControlCount:visibleCount('[ka="geek_chat_job_detail"]'),conversationCount:visibleCount('.friend-content'),selectedConversationCount:visibleCount('.friend-content.selected'),sendButtonCount:visibleCount('.btn-send')};
+ state.emptyShell=Object.values(state).every(count=>count===0);return state;
 }
 async function chatReady(m){
  guard();
  if(!location.pathname.startsWith('/web/geek/chat'))return {wait:true,reason:'任务标签尚未进入聊天路径',pagePath:safePath()};
- if(m.allowConversationSelection&&!conversationSelectionRuns.has(m.runId))return {...await selectExactConversation(m),pagePath:safePath()};
+ const scope=conversationScope(m);
+ if(m.allowConversationSelection&&!conversationSelectionRuns.has(scope))return {...await selectExactConversation(m),chatState:chatShellState(),pagePath:safePath()};
  const input=one('#chat-input'),history=one('.chat-message');
- if(!input||!history)return {...await selectExactConversation(m),pagePath:safePath()};
+ if(!input||!history)return {...await selectExactConversation(m),chatState:chatShellState(),pagePath:safePath()};
  const stability=selectedIdentityStable(m);if(stability.wait)return {...stability,pagePath:safePath()};
  let identity;
  try{identity=scopedChatIdentity(m);}catch(e){
@@ -590,6 +663,7 @@ async function chatReady(m){
 }
 async function send(m){
  guard();if(sending)throw Error('已在处理此会话，不允许重复触发');
+ requireConversationActivation(m);
  const input=one('#chat-input');const history=one('.chat-message');
  if(!input||!history)return {wait:true,reason:'聊天页面尚未加载，或页面结构不兼容'};
  const initialIdentity=scopedChatIdentity(m);if(initialIdentity.wait)return initialIdentity;
@@ -600,25 +674,27 @@ async function send(m){
   if(genuineOutgoing().length)return {status:'existing-other'};
   const stableIdentity=()=>scopedChatIdentity(m).token;
   if(stableIdentity()!==initialIdentity.token)throw Error('聊天对象发生变化，已停止');
+  requireConversationActivation(m);
   // Standard editable DOM events only. No private API, cookie, token or protocol interception.
   input.focus();if(input instanceof HTMLTextAreaElement||input instanceof HTMLInputElement){const proto=input instanceof HTMLTextAreaElement?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;Object.getOwnPropertyDescriptor(proto,'value').set.call(input,m.message);}else{input.textContent=m.message;}
   input.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:m.message}));input.dispatchEvent(new Event('change',{bubbles:true}));await sleep(300);
   await allowed(m);if(outgoingMessage(m.message))return {status:'existing'};
   if(genuineOutgoing().length)return {status:'existing-other'};
   if(stableIdentity()!==initialIdentity.token)throw Error('发送前聊天对象变化，已停止');
+  requireConversationActivation(m);
   const btn=one('.btn-send');if(!btn||btn.disabled||btn.getAttribute('aria-disabled')==='true'||/disabled/.test(btn.className))throw Error('发送按钮不可用，已停止');
   const draft=input instanceof HTMLTextAreaElement||input instanceof HTMLInputElement?input.value:input.textContent;if(draft!==m.message)throw Error('编辑框内容与原话术不一致，已停止');
   fresh(m);btn.click();
   let stableReceipt=null,stableReceiptReads=0;
   for(let n=0;n<24;n++){
    await sleep(500);guard();
-   if(stableIdentity()!==initialIdentity.token)return {status:'unknown',reason:'发出后聊天对象变化，无法确认结果'};
+   if(stableIdentity()!==initialIdentity.token)return {status:'unknown',failureCode:'SEND_IDENTITY_CHANGED',reason:'发出后聊天对象变化，无法确认结果',sendState:sendStateObservation(outgoingMessage(m.message),one('#chat-input'),false)};
    // Re-query on every pass. BOSS can optimistically insert a bubble and then
    // replace/remove it; retaining that detached node caused a false "sent".
    const bubble=outgoingMessage(m.message);
-   if(!bubble?.isConnected){stableReceipt=null;stableReceiptReads=0;continue;}
-   if(failedOutgoing(bubble))return {status:'unknown',reason:'消息出现失败标记，请手动核对'};
    const currentInput=one('#chat-input');
+   if(!bubble?.isConnected){stableReceipt=null;stableReceiptReads=0;continue;}
+   if(failedOutgoing(bubble))return {status:'unknown',failureCode:'SEND_FAILURE_MARKER',reason:'消息出现失败标记，请手动核对',sendState:sendStateObservation(bubble,currentInput)};
    if(!currentInput?.isConnected){stableReceipt=null;stableReceiptReads=0;continue;}
    const currentDraft=currentInput instanceof HTMLTextAreaElement||currentInput instanceof HTMLInputElement?currentInput.value:currentInput.textContent;
    const receipt=outgoingReceipt(bubble);
@@ -626,8 +702,8 @@ async function send(m){
    stableReceiptReads=receipt===stableReceipt?stableReceiptReads+1:1;stableReceipt=receipt;
    if(stableReceiptReads>=2)return {status:'sent',receipt};
   }
-  return {status:'unknown',reason:'未能同时确认完整消息、编辑框清空和公开送达/已读状态，不自动重发'};
+  return {status:'unknown',failureCode:'SEND_RECEIPT_UNCONFIRMED',reason:'未能同时确认完整消息、编辑框清空和公开送达/已读状态，不自动重发',sendState:{...sendStateObservation(outgoingMessage(m.message),one('#chat-input')),observationReads:24}};
  }finally{sending=false;}
 }
-chrome.runtime.onMessage.addListener((m,sender,respond)=>{if(sender.id!==chrome.runtime.id)return;const f={scan,detail,open,openReady,chatReady,send,diagnose,safetyDiagnostic,cancel:cancelRun}[m.command];if(!f)return;Promise.resolve().then(()=>f(m)).then(respond).catch(e=>respond({error:e.message,safety:e.safety||undefined,identityDiagnostic:e.identityDiagnostic||undefined}));return true;});
+chrome.runtime.onMessage.addListener((m,sender,respond)=>{if(sender.id!==chrome.runtime.id)return;const f={scan,detail,openPreflight,open,openReady,chatReady,send,diagnose,safetyDiagnostic,cancel:cancelRun}[m.command];if(!f)return;Promise.resolve().then(()=>f(m)).then(respond).catch(e=>respond({error:e.message,safety:e.safety||undefined,identityDiagnostic:e.identityDiagnostic||undefined}));return true;});
 })();
